@@ -1,7 +1,11 @@
 import os
 import pathlib
+import sys
 import pytest
 from sqlalchemy import create_engine, text
+
+# Add project root to path so imports work correctly
+sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 
 TEST_DATABASE_URL = os.environ.get(
     "TEST_DATABASE_URL",
