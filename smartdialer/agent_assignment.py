@@ -33,11 +33,6 @@ def attempt_assign_agent(conn, call_id: str, worker_id: str) -> bool:
     ), {"call_id": call_id, "agent_id": agent_id})
     return True
 
-def mark_answered_awaiting_agent_if_unassigned(conn, call_id: str) -> None:
-    conn.execute(text(
-        "UPDATE calls SET status='AWAITING_AGENT', updated_at=now() WHERE id=:id AND status='ANSWERED' AND agent_id IS NULL"
-    ), {"id": call_id})
-
 def sweep_awaiting_agent(conn, worker_id: str) -> int:
     rows = conn.execute(text(
         "SELECT id FROM calls WHERE status='AWAITING_AGENT' "
