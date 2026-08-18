@@ -81,7 +81,7 @@ def test_completed_provider_status_releases_agent_to_wrap_up_not_directly_availa
     # Final correction #2: Agent CONNECTED -> WRAP_UP -> AVAILABLE must be explicit even on
     # the reaper's reconciliation path, matching the live event-ingestion path (Task 6).
     with clean_db.begin() as conn:
-        call_id = _stale_call(conn, provider_call_id="prov-done-1", agent_id=1, status="CONNECTED")
+        call_id = _stale_call(conn, provider_call_id="prov-done-1", agent_id=1, status="INITIATED")
 
     class CompletedProvider:
         async def get_call_status(self, provider_call_id):

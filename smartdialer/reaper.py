@@ -7,7 +7,7 @@ REAP_LEASE_SECONDS = 30
 async def reap_stale_leases(conn, worker_id: str, provider, max_attempts: int = 3) -> int:
     rows = conn.execute(text(
         "SELECT id, agent_id, provider_call_id, reap_attempts FROM calls "
-        "WHERE status IN ('RESERVED','INITIATED','DIALING','CONNECTED') "
+        "WHERE status IN ('RESERVED','INITIATED','DIALING') "
         "AND lease_expires_at < now() "
         "FOR UPDATE SKIP LOCKED"
     )).fetchall()
