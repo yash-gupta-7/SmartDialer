@@ -117,3 +117,88 @@ def test_abandon_rate_denominator_excludes_completed_calls_that_never_had_an_age
     with clean_db.begin() as conn:
         plan = controller.evaluate(conn, campaign_id=1, mode="predictive", requested_count=17, reasoning="test")
     assert plan.predictive_unassigned_count == 0
+
+
+def test_high_answer_rate_allows_normal_predictive_operation(clean_db):
+    # Required test 1: a healthy rolling answer rate must not trip fallback, and
+    # predictive_unassigned_count should be able to come out nonzero as usual.
+    with clean_db.begin() as conn:
+        _seed(conn, n_available=10, n_freeing_soon=20, mode="predictive")
+        for _ in range(20):
+            conn.execute(text("INSERT INTO borrowers (campaign_id, phone_number) VALUES (1, '+1h')"))
+        # 20 recent attempts, 18 answered (COMPLETED with an agent) -> 90% rolling answer
+        # rate, comfortably above the 0.15 floor.
+        for i in range(20):
+            status = "COMPLETED" if i < 18 else "FAILED"
+            conn.execute(text(
+                "INSERT INTO calls (campaign_id, borrower_id, agent_id, status, allocation_mode) "
+                "VALUES (1, :bid, 1, :status, 'PREDICTIVE_UNASSIGNED')"
+            ), {"bid": i + 1, "status": status})
+    controller = SafetyController()
+    with clean_db.begin() as conn:
+        plan = controller.evaluate(conn, campaign_id=1, mode="predictive", requested_count=17, reasoning="test")
+    assert plan.predictive_unassigned_count > 0
+
+
+def test_answer_rate_counts_agentless_completed_calls_as_answered(clean_db):
+    # Required test 4: unlike the abandon-rate query, an agentless COMPLETED call reached
+    # ANSWERED at some point and must count as "answered" here, not be excluded. 4 agentless
+    # COMPLETED + 16 FAILED = 4/20 = 0.20, above the 0.15 floor -> no fallback. The old (buggy)
+    # query reused abandon-rate's agentless-COMPLETED exclusion here too, which would have
+    # wrongly scored these as un-answered (0/20 = 0.0) and tripped fallback.
+    with clean_db.begin() as conn:
+        _seed(conn, n_available=10, n_freeing_soon=20, mode="predictive")
+        for _ in range(20):
+            conn.execute(text("INSERT INTO borrowers (campaign_id, phone_number) VALUES (1, '+1z')"))
+        for i in range(20):
+            status = "COMPLETED" if i < 4 else "FAILED"
+            conn.execute(text(
+                "INSERT INTO calls (campaign_id, borrower_id, agent_id, status, allocation_mode) "
+                "VALUES (1, :bid, NULL, :status, 'PREDICTIVE_UNASSIGNED')"
+            ), {"bid": i + 1, "status": status})
+    controller = SafetyController()
+    with clean_db.begin() as conn:
+        plan = controller.evaluate(conn, campaign_id=1, mode="predictive", requested_count=17, reasoning="test")
+    assert plan.predictive_unassigned_count > 0
+
+
+def test_answer_rate_recovery_breaks_self_latch(clean_db):
+    # Required test 3: proves the self-latch is actually broken. Once a bad answer-rate
+    # reading forces predictive_unassigned_count to 0, the allocator stops creating new
+    # PREDICTIVE_UNASSIGNED calls for the campaign, so a sample scoped only to that
+    # allocation_mode could never see fresh data again. AGENT_BOUND calls keep flowing
+    # regardless of predictive fallback, so seeding fresh, well-answered AGENT_BOUND
+    # observations must let a later evaluate() call lift the campaign back out of fallback.
+    with clean_db.begin() as conn:
+        _seed(conn, n_available=10, n_freeing_soon=20, mode="predictive")
+        for _ in range(20):
+            conn.execute(text("INSERT INTO borrowers (campaign_id, phone_number) VALUES (1, '+1x')"))
+        # 20 recent attempts, only 1 answered -> ~5% rolling answer rate, well below the floor.
+        for i in range(20):
+            status = "COMPLETED" if i == 0 else "FAILED"
+            conn.execute(text(
+                "INSERT INTO calls (campaign_id, borrower_id, agent_id, status, allocation_mode, updated_at) "
+                "VALUES (1, :bid, CASE WHEN :status='COMPLETED' THEN 1 ELSE NULL END, :status, "
+                "'PREDICTIVE_UNASSIGNED', now() - interval '1 hour')"
+            ), {"bid": i + 1, "status": status})
+
+    controller = SafetyController()
+    with clean_db.begin() as conn:
+        first_plan = controller.evaluate(conn, campaign_id=1, mode="predictive", requested_count=17, reasoning="test")
+    assert first_plan.predictive_unassigned_count == 0  # fallback tripped, as before
+
+    # No new PREDICTIVE_UNASSIGNED calls get created while in fallback (that's the real
+    # system's behavior under this exact bug) — but AGENT_BOUND calls keep flowing
+    # regardless, and now answer well.
+    with clean_db.begin() as conn:
+        for _ in range(30):
+            conn.execute(text("INSERT INTO borrowers (campaign_id, phone_number) VALUES (1, '+1y')"))
+        for i in range(30):
+            conn.execute(text(
+                "INSERT INTO calls (campaign_id, borrower_id, agent_id, status, allocation_mode, updated_at) "
+                "VALUES (1, :bid, 1, 'COMPLETED', 'AGENT_BOUND', now())"
+            ), {"bid": i + 21})
+
+    with clean_db.begin() as conn:
+        second_plan = controller.evaluate(conn, campaign_id=1, mode="predictive", requested_count=17, reasoning="test")
+    assert second_plan.predictive_unassigned_count > 0  # recovered once conditions improved

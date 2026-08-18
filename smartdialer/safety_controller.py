@@ -38,20 +38,36 @@ class SafetyController:
                 abandoned = sum(1 for r in recent_outcomes if r[0] == "ABANDONED")
                 abandon_rate = abandoned / len(recent_outcomes)
 
-            # fix #10: rolling observed provider-answer-rate, independent of the abandon-rate
-            # check above — either signal can trigger fallback on its own. FAILED calls never
-            # count toward abandon_rate's denominator (it only samples CONNECTED/ABANDONED/
-            # COMPLETED), so a provider that stops answering at all needs its own check.
+            # fix #10 (corrective pass): rolling observed provider-answer-rate, independent of
+            # the abandon-rate check above — either signal can trigger fallback on its own.
+            # FAILED calls never count toward abandon_rate's denominator (it only samples
+            # CONNECTED/ABANDONED/COMPLETED), so a provider that stops answering at all needs
+            # its own check.
+            #
+            # Sampled across the WHOLE campaign (both AGENT_BOUND and PREDICTIVE_UNASSIGNED),
+            # not scoped to allocation_mode='PREDICTIVE_UNASSIGNED': once this check trips and
+            # zeroes out predictive_unassigned_count, the allocator stops creating any more
+            # PREDICTIVE_UNASSIGNED calls for the campaign, so a predictive-only sample would
+            # self-latch — the metric that could prove recovery would never receive fresh
+            # observations again. AGENT_BOUND calls keep being created and answered regardless
+            # of predictive fallback state, giving this signal a live population to observe.
+            #
+            # "attempted" = reached at least a real dial (excludes QUEUED/RESERVED, which never
+            # dialed). "answered" = reached at least ANSWERED at some point (ANSWERED,
+            # AWAITING_AGENT, CONNECTED, COMPLETED, or ABANDONED) — this is a different
+            # denominator/numerator than the abandon-rate query above on purpose: a COMPLETED
+            # call with no agent was still genuinely answered by the provider, so (unlike
+            # abandon-rate's "successful connect" filter) it must NOT be excluded here.
             recent_attempts = conn.execute(text(
                 "SELECT status FROM calls WHERE campaign_id=:cid "
-                "AND status IN ('COMPLETED', 'FAILED', 'ABANDONED', 'CANCELLED') "
-                "AND allocation_mode = 'PREDICTIVE_UNASSIGNED' "
-                "AND (status <> 'COMPLETED' OR agent_id IS NOT NULL) "
+                "AND status NOT IN ('QUEUED', 'RESERVED') "
                 "ORDER BY updated_at DESC LIMIT 30"
             ), {"cid": campaign_id}).fetchall()
             rolling_answer_rate = None
             if recent_attempts:
-                answered = sum(1 for r in recent_attempts if r[0] in ("COMPLETED", "ABANDONED"))
+                answered = sum(1 for r in recent_attempts if r[0] in (
+                    "ANSWERED", "AWAITING_AGENT", "CONNECTED", "COMPLETED", "ABANDONED"
+                ))
                 rolling_answer_rate = answered / len(recent_attempts)
 
             fallback_reason = None
