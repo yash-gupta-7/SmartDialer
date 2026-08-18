@@ -23,6 +23,7 @@ class SafetyController:
             recent_outcomes = conn.execute(text(
                 "SELECT status FROM calls WHERE campaign_id=:cid "
                 "AND status IN ('CONNECTED', 'ABANDONED', 'COMPLETED') "
+                "AND allocation_mode = 'PREDICTIVE_UNASSIGNED' "
                 "ORDER BY updated_at DESC LIMIT 30"
             ), {"cid": campaign_id}).fetchall()
             abandon_rate = 0.0
