@@ -16,6 +16,14 @@ class MockProviderA:
         self._events: asyncio.Queue[ProviderEvent] = asyncio.Queue()
         self._idempotency_index: dict[str, str] = {}
         self._call_status: dict[str, str] = {}
+        # ponytail: standard fire-and-forget idiom — asyncio only weak-refs tasks
+        # internally, so an unreferenced task can be GC'd mid-run.
+        self._background_tasks: set[asyncio.Task] = set()
+
+    def _spawn(self, coro) -> None:
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     async def place_call(self, call_id: str, phone_number: str, idempotency_key: str) -> str:
         if idempotency_key in self._idempotency_index:
@@ -24,7 +32,7 @@ class MockProviderA:
         self._idempotency_index[idempotency_key] = provider_call_id
         self._call_status[provider_call_id] = "INITIATED"
         await self._events.put(self._make_event(provider_call_id, "INITIATED"))
-        asyncio.create_task(self._simulate_call(provider_call_id))
+        self._spawn(self._simulate_call(provider_call_id))
         return provider_call_id
 
     def _make_event(self, provider_call_id: str, event_type: str) -> ProviderEvent:
