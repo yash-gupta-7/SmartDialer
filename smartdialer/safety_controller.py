@@ -52,15 +52,18 @@ class SafetyController:
             # observations again. AGENT_BOUND calls keep being created and answered regardless
             # of predictive fallback state, giving this signal a live population to observe.
             #
-            # "attempted" = reached at least a real dial (excludes QUEUED/RESERVED, which never
-            # dialed). "answered" = reached at least ANSWERED at some point (ANSWERED,
+            # "attempted" = reached an observable outcome (excludes QUEUED/RESERVED, which never
+            # dialed, and also INITIATED/RINGING, which are still in-flight and haven't reached
+            # an answer/no-answer outcome yet — counting them as "not answered" would bias the
+            # rate downward, especially under load with many calls mid-dial at once).
+            # "answered" = reached at least ANSWERED at some point (ANSWERED,
             # AWAITING_AGENT, CONNECTED, COMPLETED, or ABANDONED) — this is a different
             # denominator/numerator than the abandon-rate query above on purpose: a COMPLETED
             # call with no agent was still genuinely answered by the provider, so (unlike
             # abandon-rate's "successful connect" filter) it must NOT be excluded here.
             recent_attempts = conn.execute(text(
                 "SELECT status FROM calls WHERE campaign_id=:cid "
-                "AND status NOT IN ('QUEUED', 'RESERVED') "
+                "AND status NOT IN ('QUEUED', 'RESERVED', 'INITIATED', 'RINGING') "
                 "ORDER BY updated_at DESC LIMIT 30"
             ), {"cid": campaign_id}).fetchall()
             rolling_answer_rate = None

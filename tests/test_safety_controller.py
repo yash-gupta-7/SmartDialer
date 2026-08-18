@@ -202,3 +202,36 @@ def test_answer_rate_recovery_breaks_self_latch(clean_db):
     with clean_db.begin() as conn:
         second_plan = controller.evaluate(conn, campaign_id=1, mode="predictive", requested_count=17, reasoning="test")
     assert second_plan.predictive_unassigned_count > 0  # recovered once conditions improved
+
+
+def test_answer_rate_excludes_in_flight_initiated_and_ringing_calls(clean_db):
+    # In-flight calls (INITIATED, RINGING) haven't reached an observable answer/no-answer
+    # outcome yet and must be excluded from both the numerator and denominator of the rolling
+    # answer-rate sample -- not counted as "not answered". 3 answered (ANSWERED/CONNECTED/
+    # COMPLETED) + 2 terminal-unanswered (FAILED/CANCELLED) + 25 in-flight (13 INITIATED, 12
+    # RINGING) = 30 rows total (all fit under the LIMIT 30 sample regardless of order).
+    #
+    # Post-fix: denominator excludes the 25 in-flight rows -> 3/(3+2) = 0.6, comfortably
+    # above the 0.15 floor -> no fallback, predictive_unassigned_count > 0.
+    # Pre-fix (buggy `status NOT IN ('QUEUED','RESERVED')` query): the 25 in-flight rows are
+    # included and counted as un-answered -> 3/30 = 0.1, below the 0.15 floor -> fallback
+    # trips and predictive_unassigned_count == 0. So this assertion is sensitive to the fix.
+    with clean_db.begin() as conn:
+        _seed(conn, n_available=10, n_freeing_soon=20, mode="predictive")
+        for _ in range(30):
+            conn.execute(text("INSERT INTO borrowers (campaign_id, phone_number) VALUES (1, '+1w')"))
+        rows = (
+            [("ANSWERED", None), ("CONNECTED", 1), ("COMPLETED", 1)]
+            + [("FAILED", None), ("CANCELLED", None)]
+            + [("INITIATED", None)] * 13
+            + [("RINGING", None)] * 12
+        )
+        for i, (status, agent_id) in enumerate(rows):
+            conn.execute(text(
+                "INSERT INTO calls (campaign_id, borrower_id, agent_id, status, allocation_mode) "
+                "VALUES (1, :bid, :aid, :status, 'PREDICTIVE_UNASSIGNED')"
+            ), {"bid": i + 1, "aid": agent_id, "status": status})
+    controller = SafetyController()
+    with clean_db.begin() as conn:
+        plan = controller.evaluate(conn, campaign_id=1, mode="predictive", requested_count=17, reasoning="test")
+    assert plan.predictive_unassigned_count > 0
