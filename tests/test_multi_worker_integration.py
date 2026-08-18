@@ -59,8 +59,10 @@ def test_two_real_worker_processes_same_campaign_no_double_allocation(clean_db):
             [sys.executable, launcher, "w2", "1", "progressive", "A", "3", str(barrier)], env=env
         )
         barrier.write_text("go")
-        proc_a.wait(timeout=15)
-        proc_b.wait(timeout=15)
+        # A nested subprocess launch (python -m smartdialer.worker) adds interpreter
+        # startup + argparse overhead on top of the hand-rolled loop this replaced.
+        proc_a.wait(timeout=30)
+        proc_b.wait(timeout=30)
 
     with clean_db.connect() as conn:
         total_calls = conn.execute(text("SELECT count(*) FROM calls")).scalar()
