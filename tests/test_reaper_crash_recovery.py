@@ -129,3 +129,33 @@ def test_reaper_never_connects_predictive_call_without_a_real_agent(clean_db):
         ), {"id": call_id}).fetchone()
     assert status == "AWAITING_AGENT"
     assert agent_id is None
+
+def test_terminal_status_race_during_provider_await_is_not_overwritten(clean_db):
+    # Terminal-state race: the reaper's scan (Transaction 1) claims a call while it is still
+    # RESERVED/INITIATED/DIALING, then awaits the provider with no transaction open. If a
+    # live worker's ingest_event() wins the race and advances the call to a terminal status
+    # during that exact await window, the reaper's subsequent apply-UPDATE (Transaction 2)
+    # must not resurrect/overwrite it — terminal calls are sticky (transitions.py,
+    # classify_call_event). Simulated deterministically: the stub provider's own
+    # get_call_status() performs the "concurrent worker" update on a separate connection
+    # before returning a status that would otherwise cause the reaper to apply COMPLETED.
+    with clean_db.begin() as conn:
+        call_id = _stale_call(conn, provider_call_id="prov-race-1", agent_id=None, status="INITIATED",
+                               allocation_mode="PREDICTIVE_UNASSIGNED")
+
+    class ConcurrentTerminalProvider:
+        async def get_call_status(self, provider_call_id):
+            with clean_db.begin() as conn2:
+                conn2.execute(text(
+                    "UPDATE calls SET status='CANCELLED', updated_at=now() WHERE id=:id"
+                ), {"id": call_id})
+            return "COMPLETED"
+
+    async def run():
+        return await reap_stale_leases(clean_db, worker_id="reaper-1", provider=ConcurrentTerminalProvider())
+    reconciled = asyncio.run(run())
+    assert reconciled == 0  # guarded UPDATE matched 0 rows — benign race, not an error
+
+    with clean_db.connect() as conn:
+        status = conn.execute(text("SELECT status FROM calls WHERE id=:id"), {"id": call_id}).scalar()
+    assert status == "CANCELLED"  # must NOT have been overwritten back to COMPLETED

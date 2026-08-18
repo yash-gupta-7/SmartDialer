@@ -6,6 +6,11 @@ from smartdialer.transitions import borrower_status_for_call
 REAP_GRACE_SECONDS = 5
 REAP_LEASE_SECONDS = 30
 
+# fix (terminal-state race): every apply-UPDATE that writes calls.status during reconciliation
+# must not resurrect a call a concurrent worker's ingest_event() has already advanced to a
+# terminal status during the provider-await window between the scan and apply transactions.
+TERMINAL_STATUSES_SQL = "('COMPLETED','FAILED','CANCELLED','ABANDONED')"
+
 
 def _release_borrower(conn, call_id, call_status: CallStatus) -> None:
     # fix #5: keep the borrower lifecycle in sync with the reaper's own terminal outcomes,
@@ -54,9 +59,14 @@ async def _reconcile_one(sql_engine, worker_id, provider, max_attempts, call_id,
         # by max_attempts. Only after attempts are exhausted do we fail and release.
         if reap_attempts >= max_attempts:
             with sql_engine.begin() as conn:
-                conn.execute(text(
-                    "UPDATE calls SET status='FAILED', updated_at=now() WHERE id=:id"
+                result = conn.execute(text(
+                    "UPDATE calls SET status='FAILED', updated_at=now() "
+                    f"WHERE id=:id AND status NOT IN {TERMINAL_STATUSES_SQL}"
                 ), {"id": call_id})
+                if result.rowcount == 0:
+                    # Already advanced to a terminal status by something else — benign race,
+                    # not an error. Do not overwrite, do not retry.
+                    return 0
                 if agent_id is not None:
                     conn.execute(text(
                         "UPDATE agents SET status='AVAILABLE', worker_id=NULL WHERE id=:id"
@@ -75,11 +85,13 @@ async def _reconcile_one(sql_engine, worker_id, provider, max_attempts, call_id,
                 ), {"grace": REAP_GRACE_SECONDS, "id": call_id})
             return 0
         with sql_engine.begin() as conn:
-            conn.execute(text(
+            result = conn.execute(text(
                 "UPDATE calls SET status='INITIATED', provider_call_id=:pcid, worker_id=:wid, "
                 "lease_expires_at=now() + interval '30 seconds', reap_attempts=reap_attempts+1, "
-                "updated_at=now() WHERE id=:id"
+                f"updated_at=now() WHERE id=:id AND status NOT IN {TERMINAL_STATUSES_SQL}"
             ), {"pcid": new_provider_call_id, "wid": worker_id, "id": call_id})
+            if result.rowcount == 0:
+                return 0
         return 1
 
     # Case 2+: a provider call was confirmed created at some point — ask for ground truth.
@@ -95,35 +107,50 @@ async def _reconcile_one(sql_engine, worker_id, provider, max_attempts, call_id,
         return 0
     elif provider_status in ("INITIATED", "RINGING"):
         with sql_engine.begin() as conn:
-            conn.execute(text(
+            result = conn.execute(text(
                 "UPDATE calls SET worker_id=:wid, lease_expires_at=now() + interval '30 seconds', "
-                "status=:pstatus, updated_at=now() WHERE id=:id"
+                f"status=:pstatus, updated_at=now() WHERE id=:id AND status NOT IN {TERMINAL_STATUSES_SQL}"
             ), {"wid": worker_id, "pstatus": provider_status, "id": call_id})
+            if result.rowcount == 0:
+                return 0
         return 1
     elif provider_status == "ANSWERED":
         with sql_engine.begin() as conn:
             if agent_id is not None:
                 # Agent-bound: agent already reserved, safe to collapse straight to CONNECTED.
-                conn.execute(text(
+                result = conn.execute(text(
                     "UPDATE calls SET worker_id=:wid, status='CONNECTED', updated_at=now(), "
-                    "answered_at = COALESCE(answered_at, now()) WHERE id=:id"
+                    "answered_at = COALESCE(answered_at, now()) "
+                    f"WHERE id=:id AND status NOT IN {TERMINAL_STATUSES_SQL}"
                 ), {"wid": worker_id, "id": call_id})
+                if result.rowcount == 0:
+                    return 0
             else:
                 # Predictive-unassigned: never fabricate CONNECTED without a real agent.
                 # Record ANSWERED first, then run the exact same atomic assignment race used
                 # by the live ANSWERED-event path — CONNECTED if an agent is claimed,
                 # AWAITING_AGENT (never a bare CONNECTED with NULL agent_id) otherwise.
-                conn.execute(text(
+                # Guarded here (rather than only inside attempt_assign_agent) because this is
+                # the step that would otherwise resurrect a call a concurrent worker already
+                # advanced to a terminal status — attempt_assign_agent's own guard only
+                # protects its own two updates, not this initial ANSWERED write.
+                result = conn.execute(text(
                     "UPDATE calls SET worker_id=:wid, status='ANSWERED', updated_at=now(), "
-                    "answered_at = COALESCE(answered_at, now()) WHERE id=:id"
+                    "answered_at = COALESCE(answered_at, now()) "
+                    f"WHERE id=:id AND status NOT IN {TERMINAL_STATUSES_SQL}"
                 ), {"wid": worker_id, "id": call_id})
+                if result.rowcount == 0:
+                    return 0
                 attempt_assign_agent(conn, str(call_id), worker_id)
         return 1
     elif provider_status == "COMPLETED":
         with sql_engine.begin() as conn:
-            conn.execute(text(
-                "UPDATE calls SET status='COMPLETED', updated_at=now() WHERE id=:id"
+            result = conn.execute(text(
+                "UPDATE calls SET status='COMPLETED', updated_at=now() "
+                f"WHERE id=:id AND status NOT IN {TERMINAL_STATUSES_SQL}"
             ), {"id": call_id})
+            if result.rowcount == 0:
+                return 0
             if agent_id is not None:
                 # Explicit WRAP_UP lifecycle (final correction #2): CONNECTED -> WRAP_UP ->
                 # AVAILABLE, never straight to AVAILABLE. sweep_wrap_up (Task 8) completes
@@ -137,9 +164,12 @@ async def _reconcile_one(sql_engine, worker_id, provider, max_attempts, call_id,
         return 1
     elif provider_status in ("FAILED", "CANCELLED"):
         with sql_engine.begin() as conn:
-            conn.execute(text(
-                "UPDATE calls SET status=:status, updated_at=now() WHERE id=:id"
+            result = conn.execute(text(
+                "UPDATE calls SET status=:status, updated_at=now() "
+                f"WHERE id=:id AND status NOT IN {TERMINAL_STATUSES_SQL}"
             ), {"status": provider_status, "id": call_id})
+            if result.rowcount == 0:
+                return 0
             if agent_id is not None:
                 conn.execute(text(
                     "UPDATE agents SET status='AVAILABLE', worker_id=NULL WHERE id=:id"
