@@ -5,6 +5,8 @@ from smartdialer.enums import PacingDecisionType
 
 ABANDON_RATE_FALLBACK_THRESHOLD = 0.5   # observed abandons among recent connected+abandoned calls
 SETUP_TIME_WINDOW_SECONDS = 30
+ANSWER_RATE_FLOOR = 0.15   # fix #10: rolling observed provider-answer-rate floor, independent
+                           # of the abandon-rate check — catches drift before it shows up as abandons.
 
 class SafetyController:
     def evaluate(self, conn, campaign_id: int, mode: str, requested_count: int,
@@ -20,10 +22,15 @@ class SafetyController:
         decision_reason = reasoning
 
         if mode == "predictive" and remaining_request > 0:
+            # fix #4: a call that was never assigned an agent (AWAITING_AGENT -> COMPLETED,
+            # common since the mock providers' compressed talk time often beats
+            # abandon_stale_awaiting_agent's grace window) must not count as a "successful
+            # connect" in this denominator.
             recent_outcomes = conn.execute(text(
                 "SELECT status FROM calls WHERE campaign_id=:cid "
                 "AND status IN ('CONNECTED', 'ABANDONED', 'COMPLETED') "
                 "AND allocation_mode = 'PREDICTIVE_UNASSIGNED' "
+                "AND (status <> 'COMPLETED' OR agent_id IS NOT NULL) "
                 "ORDER BY updated_at DESC LIMIT 30"
             ), {"cid": campaign_id}).fetchall()
             abandon_rate = 0.0
@@ -31,9 +38,34 @@ class SafetyController:
                 abandoned = sum(1 for r in recent_outcomes if r[0] == "ABANDONED")
                 abandon_rate = abandoned / len(recent_outcomes)
 
+            # fix #10: rolling observed provider-answer-rate, independent of the abandon-rate
+            # check above — either signal can trigger fallback on its own. FAILED calls never
+            # count toward abandon_rate's denominator (it only samples CONNECTED/ABANDONED/
+            # COMPLETED), so a provider that stops answering at all needs its own check.
+            recent_attempts = conn.execute(text(
+                "SELECT status FROM calls WHERE campaign_id=:cid "
+                "AND status IN ('COMPLETED', 'FAILED', 'ABANDONED', 'CANCELLED') "
+                "AND allocation_mode = 'PREDICTIVE_UNASSIGNED' "
+                "AND (status <> 'COMPLETED' OR agent_id IS NOT NULL) "
+                "ORDER BY updated_at DESC LIMIT 30"
+            ), {"cid": campaign_id}).fetchall()
+            rolling_answer_rate = None
+            if recent_attempts:
+                answered = sum(1 for r in recent_attempts if r[0] in ("COMPLETED", "ABANDONED"))
+                rolling_answer_rate = answered / len(recent_attempts)
+
+            fallback_reason = None
             if abandon_rate >= ABANDON_RATE_FALLBACK_THRESHOLD:
+                fallback_reason = f"observed abandon_rate={abandon_rate:.2f} >= threshold; falling back to progressive"
+            elif rolling_answer_rate is not None and rolling_answer_rate < ANSWER_RATE_FLOOR:
+                fallback_reason = (
+                    f"observed rolling answer_rate={rolling_answer_rate:.2f} < floor="
+                    f"{ANSWER_RATE_FLOOR}; falling back to progressive"
+                )
+
+            if fallback_reason:
                 decision = PacingDecisionType.FALLBACK_TO_PROGRESSIVE
-                decision_reason = f"observed abandon_rate={abandon_rate:.2f} >= threshold; falling back to progressive"
+                decision_reason = fallback_reason
             else:
                 freeing_soon = conn.execute(text(
                     "SELECT count(*) FROM agents WHERE estimated_free_at IS NOT NULL "

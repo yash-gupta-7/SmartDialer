@@ -58,6 +58,12 @@ async def run_all_scenarios(sql_engine):
     results = []
     for name, rate, talk_time, provider_name in scenarios:
         with sql_engine.begin() as conn:
+            # fix #7: agents aren't scoped by campaign, so without this each later scenario
+            # would run against an inflated pool of leftover agents from earlier scenarios,
+            # making the four scenarios' output incomparable. CASCADE also clears calls
+            # (agent_id FK) and provider_events (call_id FK) from the prior scenario, whose
+            # results were already captured into `results` above.
+            conn.execute(text("TRUNCATE TABLE agents RESTART IDENTITY CASCADE"))
             row = conn.execute(text(
                 "INSERT INTO campaigns (name, mode) VALUES (:name, 'predictive') RETURNING id"
             ), {"name": f"sim-{name}"}).fetchone()

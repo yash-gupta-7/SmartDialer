@@ -24,7 +24,6 @@ class Worker:
         self.pacing = ProgressivePacingEngine() if mode == "progressive" else PredictivePacingEngine()
         self.safety = SafetyController()
         self.allocator = CallAllocator()
-        self._pending_call_by_provider_id: dict[str, str] = {}
 
     async def run_pacing_cycle(self):
         with self.sql_engine.connect() as conn:
@@ -34,13 +33,6 @@ class Worker:
         # Task 7 fix #2: CallAllocator.execute() takes the engine, not an open conn/transaction
         # — it manages its own transactions around the provider call internally.
         call_ids = await self.allocator.execute(self.sql_engine, plan, self.campaign_id, self.worker_id, self.provider)
-        if call_ids:
-            with self.sql_engine.connect() as conn:
-                rows = conn.execute(text(
-                    "SELECT id, provider_call_id FROM calls WHERE id = ANY(:ids)"
-                ), {"ids": call_ids}).fetchall()
-            for call_id, provider_call_id in rows:
-                self._pending_call_by_provider_id[provider_call_id] = str(call_id)
         return call_ids
 
     async def drain_events_once(self, timeout: float = 0.5):
@@ -48,18 +40,27 @@ class Worker:
             event = await asyncio.wait_for(self.provider.next_event(), timeout=timeout)
         except asyncio.TimeoutError:
             return None
-        call_id = self._pending_call_by_provider_id.get(event.provider_call_id)
         with self.sql_engine.begin() as conn:
+            # fix #9: resolve provider_call_id -> call_id via Postgres (the single source of
+            # truth for everything else in this system), not an in-process dict that only
+            # knows about calls THIS worker instance allocated — a per-worker dict silently
+            # breaks event routing across worker restarts/multiple workers.
+            row = conn.execute(text(
+                "SELECT id FROM calls WHERE provider_call_id=:pcid"
+            ), {"pcid": event.provider_call_id}).fetchone()
+            call_id = str(row[0]) if row is not None else None
             classification = ingest_event(conn, event, call_id)
             if event.event_type == "ANSWERED" and call_id is not None:
-                row = conn.execute(text("SELECT agent_id FROM calls WHERE id=:id"), {"id": call_id}).fetchone()
-                if row and row[0] is None:
+                agent_row = conn.execute(text("SELECT agent_id FROM calls WHERE id=:id"), {"id": call_id}).fetchone()
+                if agent_row and agent_row[0] is None:
                     attempt_assign_agent(conn, call_id, self.worker_id)
         return classification
 
     async def run_maintenance_cycle(self):
+        # fix #8: reap_stale_leases manages its own short transactions around provider
+        # awaits (see reaper.py) — it must not be nested inside this method's transaction.
+        reconciled = await reap_stale_leases(self.sql_engine, self.worker_id, self.provider)
         with self.sql_engine.begin() as conn:
-            reconciled = await reap_stale_leases(conn, self.worker_id, self.provider)
             connected = sweep_awaiting_agent(conn, self.worker_id)
             abandoned = abandon_stale_awaiting_agent(conn)
             wrapped_up = sweep_wrap_up(conn)

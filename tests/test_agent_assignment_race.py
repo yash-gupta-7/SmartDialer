@@ -118,6 +118,29 @@ def test_attempt_assign_agent_sets_estimated_free_at(clean_db):
         estimated_free_at = conn.execute(text("SELECT estimated_free_at FROM agents WHERE id=1")).scalar()
     assert estimated_free_at is not None
 
+def test_attempt_assign_agent_releases_agent_when_call_already_terminal(clean_db):
+    # fix #2 regression test: the call moved to a terminal status (e.g. ABANDONED, via a
+    # race with abandon_stale_awaiting_agent or a duplicate provider event) between when the
+    # agent is atomically claimed and when the calls-row UPDATE runs. Before the fix, the
+    # calls UPDATE's rowcount was never checked, so the agent was left CONNECTED forever
+    # with no call referencing it.
+    with clean_db.begin() as conn:
+        conn.execute(text("INSERT INTO campaigns (name, mode) VALUES ('c1','predictive')"))
+        conn.execute(text("INSERT INTO agents (status) VALUES ('AVAILABLE')"))
+        conn.execute(text("INSERT INTO borrowers (campaign_id, phone_number) VALUES (1,'+1a')"))
+        row = conn.execute(text(
+            "INSERT INTO calls (campaign_id, borrower_id, status, allocation_mode) "
+            "VALUES (1, 1, 'ABANDONED', 'PREDICTIVE_UNASSIGNED') RETURNING id"
+        )).fetchone()
+        call_id = str(row[0])
+    with clean_db.begin() as conn:
+        connected = attempt_assign_agent(conn, call_id, worker_id="w1")
+    assert connected is False
+    with clean_db.connect() as conn:
+        agent_status = conn.execute(text("SELECT status FROM agents WHERE id=1")).scalar()
+    assert agent_status == "AVAILABLE"
+
+
 def test_sweep_wrap_up_returns_agent_to_available_after_window(clean_db):
     with clean_db.begin() as conn:
         conn.execute(text(
@@ -129,6 +152,40 @@ def test_sweep_wrap_up_returns_agent_to_available_after_window(clean_db):
     with clean_db.connect() as conn:
         status = conn.execute(text("SELECT status FROM agents WHERE id=1")).scalar()
     assert status == "AVAILABLE"
+
+def test_wrap_up_via_real_transition_path_is_not_immediately_swept(clean_db):
+    # fix #6 regression test: previously nothing that set agents.status='WRAP_UP' also set
+    # updated_at=now() in that same UPDATE, so updated_at kept reflecting row-creation time
+    # and sweep_wrap_up fired immediately regardless of the configured window. This goes
+    # through the REAL transition path (events.ingest_event, exactly as production does),
+    # not a hand-staged updated_at, and proves a generous wrap-up window is honored.
+    from datetime import datetime, timezone
+    from smartdialer.providers.base import ProviderEvent
+    from smartdialer.events import ingest_event
+
+    with clean_db.begin() as conn:
+        conn.execute(text("INSERT INTO campaigns (name, mode) VALUES ('c1','progressive')"))
+        conn.execute(text("INSERT INTO borrowers (campaign_id, phone_number) VALUES (1, '+15550000')"))
+        conn.execute(text("INSERT INTO agents (status) VALUES ('DIALING')"))
+        row = conn.execute(text(
+            "INSERT INTO calls (campaign_id, borrower_id, agent_id, status, allocation_mode) "
+            "VALUES (1, 1, 1, 'CONNECTED', 'AGENT_BOUND') RETURNING id"
+        )).fetchone()
+        call_id = str(row[0])
+
+    event = ProviderEvent("evt-wrap", "prov-wrap-1", "COMPLETED", datetime.now(timezone.utc))
+    with clean_db.begin() as conn:
+        ingest_event(conn, event, call_id)
+    with clean_db.connect() as conn:
+        assert conn.execute(text("SELECT status FROM agents WHERE id=1")).scalar() == "WRAP_UP"
+
+    # A large configured wrap-up window (60s) must NOT sweep an agent that just transitioned.
+    with clean_db.begin() as conn:
+        swept = sweep_wrap_up(conn, wrap_up_seconds=60)
+    assert swept == 0
+    with clean_db.connect() as conn:
+        assert conn.execute(text("SELECT status FROM agents WHERE id=1")).scalar() == "WRAP_UP"
+
 
 def test_agent_uniqueness_constraint_blocks_second_concurrent_assignment(clean_db):
     # Fix #10: bypass attempt_assign_agent's own SKIP LOCKED protection entirely and try to

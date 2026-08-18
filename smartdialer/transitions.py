@@ -26,6 +26,20 @@ TERMINAL_EVENT_TARGET = {
 # Exported for events.py: combined event_type -> target-status lookup for VALID events.
 EVENT_TARGET_STATUS = {**PROGRESSION_EVENT_TARGET, **TERMINAL_EVENT_TARGET}
 
+# fix #5: what a call's borrower should become once the call reaches a terminal status —
+# CALLED on a real connect, back to PENDING so a later dial attempt can retry a borrower
+# whose call never succeeded. Shared by events.py and reaper.py so both the live
+# event-ingestion path and the crash-recovery path stay consistent.
+BORROWER_STATUS_ON_TERMINAL: dict[CallStatus, str] = {
+    CallStatus.COMPLETED: "CALLED",
+    CallStatus.FAILED: "PENDING",
+    CallStatus.CANCELLED: "PENDING",
+    CallStatus.ABANDONED: "PENDING",
+}
+
+def borrower_status_for_call(call_status: CallStatus) -> str | None:
+    return BORROWER_STATUS_ON_TERMINAL.get(call_status)
+
 # A call in one of these statuses has already moved past raw provider progression events
 # (agent-bound calls skip straight to CONNECTED; predictive calls detour through AWAITING_AGENT).
 POST_PROGRESSION_STATUSES = {CallStatus.CONNECTED, CallStatus.AWAITING_AGENT}

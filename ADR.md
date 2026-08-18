@@ -35,3 +35,27 @@ read replicas/connection pooling (PgBouncer) before considering sharding.
 ## Final question
 
 See spec section 17 (`docs/superpowers/specs/2026-08-18-smartdialer-design.md#17-final-question--short-answer`).
+
+## Known Limitations
+
+**Worker crash after CONNECTED strands the call, agent, and borrower permanently.** The
+Lease Reaper (`smartdialer/reaper.py`) deliberately excludes `CONNECTED` calls from its
+stale-lease scan — a `CONNECTED` call has no `lease_expires_at` semantics to reap against
+(the lease model governs pre-connect dialing, not live conversations), and reconciling a
+live in-progress call against provider state is a materially different problem than
+reconciling a dialing attempt. This is a controller-approved scope boundary for this
+prototype, not an oversight. Its consequence is real: if a worker process crashes after a
+call reaches `CONNECTED` but before the provider emits a terminal event that worker can
+ingest, nothing else in the system can recover it. `sweep_awaiting_agent` and
+`abandon_stale_awaiting_agent` only scan `AWAITING_AGENT`; event ingestion is inherently
+event-driven and no other worker owns that call's provider correlation. The call, its
+agent, and its borrower are stuck in `CONNECTED`/`RESERVED` forever.
+
+Production fix sketch: a periodic sweep keyed on `agents.estimated_free_at + slack`
+rather than `calls.lease_expires_at`, since `estimated_free_at` is the one piece of state
+this system keeps fresh for a connected agent regardless of which worker (if any) is still
+alive to service it. A sweep that finds a `CONNECTED` agent whose `estimated_free_at` has
+passed by more than a slack margin would query the provider directly for that agent's
+active call's ground-truth status (by `provider_call_id`, looked up from the call row) and
+reconcile from there — the same "ask the provider, don't guess" pattern the Lease Reaper
+already uses for pre-connect calls.

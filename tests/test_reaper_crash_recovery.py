@@ -26,8 +26,7 @@ def test_no_provider_call_yet_retries_place_call_with_same_idempotency_key(clean
     provider = MockProviderA(seed=1)  # idempotency keyed by call_id, same instance as the reaper uses
 
     async def run():
-        with clean_db.begin() as conn:
-            return await reap_stale_leases(conn, worker_id="reaper-1", provider=provider)
+        return await reap_stale_leases(clean_db, worker_id="reaper-1", provider=provider)
     reconciled = asyncio.run(run())
     assert reconciled == 1
 
@@ -46,8 +45,7 @@ def test_no_provider_call_after_max_attempts_fails_and_releases_agent(clean_db):
     provider = MockProviderA(seed=1)
 
     async def run():
-        with clean_db.begin() as conn:
-            return await reap_stale_leases(conn, worker_id="reaper-1", provider=provider, max_attempts=3)
+        return await reap_stale_leases(clean_db, worker_id="reaper-1", provider=provider, max_attempts=3)
     reconciled = asyncio.run(run())
     assert reconciled == 1
 
@@ -66,8 +64,7 @@ def test_unknown_provider_status_extends_lease_without_failing(clean_db):
             return None  # temporarily unavailable/unknown — NOT "no call exists"
 
     async def run():
-        with clean_db.begin() as conn:
-            return await reap_stale_leases(conn, worker_id="reaper-1", provider=UnknownStatusProvider())
+        return await reap_stale_leases(clean_db, worker_id="reaper-1", provider=UnknownStatusProvider())
     reconciled = asyncio.run(run())
     assert reconciled == 0  # not resolved this pass — correctly left pending, not failed
 
@@ -88,8 +85,7 @@ def test_completed_provider_status_releases_agent_to_wrap_up_not_directly_availa
             return "COMPLETED"
 
     async def run():
-        with clean_db.begin() as conn:
-            return await reap_stale_leases(conn, worker_id="reaper-1", provider=CompletedProvider())
+        return await reap_stale_leases(clean_db, worker_id="reaper-1", provider=CompletedProvider())
     reconciled = asyncio.run(run())
     assert reconciled == 1
 
@@ -123,8 +119,7 @@ def test_reaper_never_connects_predictive_call_without_a_real_agent(clean_db):
             return "ANSWERED"
 
     async def run():
-        with clean_db.begin() as conn:
-            return await reap_stale_leases(conn, worker_id="reaper-2", provider=StubProvider())
+        return await reap_stale_leases(clean_db, worker_id="reaper-2", provider=StubProvider())
     reconciled = asyncio.run(run())
     assert reconciled == 1
 

@@ -72,6 +72,59 @@ def test_completed_call_releases_agent_to_wrap_up(clean_db):
     assert agent_status == "WRAP_UP"
     assert estimated_free_at is None
 
+def test_awaiting_agent_call_receiving_completed_event_becomes_abandoned(clean_db):
+    # fix #4 regression test: a call waiting for an agent (never got one) whose provider
+    # then reports COMPLETED means the borrower hung up before ever reaching an agent —
+    # that's ABANDONED, not a literal COMPLETED "successful connect".
+    with clean_db.begin() as conn:
+        conn.execute(text("INSERT INTO campaigns (name, mode) VALUES ('c1','predictive')"))
+        conn.execute(text("INSERT INTO borrowers (campaign_id, phone_number) VALUES (1, '+15550000')"))
+        row = conn.execute(text(
+            "INSERT INTO calls (campaign_id, borrower_id, agent_id, status, allocation_mode) "
+            "VALUES (1, 1, NULL, 'AWAITING_AGENT', 'PREDICTIVE_UNASSIGNED') RETURNING id"
+        )).fetchone()
+        call_id = str(row[0])
+    event = ProviderEvent("evt-awa-1", "prov-awa-1", "COMPLETED", datetime.now(timezone.utc))
+    with clean_db.begin() as conn:
+        c = ingest_event(conn, event, call_id)
+    assert c == EventClassification.VALID
+    with clean_db.connect() as conn:
+        call_status, borrower_status = conn.execute(text(
+            "SELECT c.status, b.status FROM calls c JOIN borrowers b ON b.id=c.borrower_id "
+            "WHERE c.id=:id"
+        ), {"id": call_id}).fetchone()
+    assert call_status == "ABANDONED"
+    assert borrower_status == "PENDING"  # fix #5: freed for a later retry, not left RESERVED
+
+
+def test_completed_call_marks_borrower_called(clean_db):
+    # fix #5 regression test: a successful call's borrower closes out as CALLED.
+    with clean_db.begin() as conn:
+        call_id = _seed_call(conn, status="CONNECTED")
+    event = ProviderEvent("evt-bc-1", "prov-bc-1", "COMPLETED", datetime.now(timezone.utc))
+    with clean_db.begin() as conn:
+        ingest_event(conn, event, call_id)
+    with clean_db.connect() as conn:
+        borrower_status = conn.execute(text(
+            "SELECT b.status FROM calls c JOIN borrowers b ON b.id=c.borrower_id WHERE c.id=:id"
+        ), {"id": call_id}).fetchone()[0]
+    assert borrower_status == "CALLED"
+
+
+def test_failed_call_returns_borrower_to_pending_for_retry(clean_db):
+    # fix #5 regression test: a call that never connects frees its borrower to be retried.
+    with clean_db.begin() as conn:
+        call_id = _seed_call(conn, status="RINGING")
+    event = ProviderEvent("evt-bf-1", "prov-bf-1", "FAILED", datetime.now(timezone.utc))
+    with clean_db.begin() as conn:
+        ingest_event(conn, event, call_id)
+    with clean_db.connect() as conn:
+        borrower_status = conn.execute(text(
+            "SELECT b.status FROM calls c JOIN borrowers b ON b.id=c.borrower_id WHERE c.id=:id"
+        ), {"id": call_id}).fetchone()[0]
+    assert borrower_status == "PENDING"
+
+
 def test_late_event_does_not_resurrect_terminal_call(clean_db):
     with clean_db.begin() as conn:
         call_id = _seed_call(conn, status="COMPLETED")
