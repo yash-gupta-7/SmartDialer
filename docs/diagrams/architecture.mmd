@@ -1,0 +1,17 @@
+flowchart TD
+    Campaign --> Pacing["Pacing Engine\n(Progressive | Predictive — interchangeable)"]
+    Pacing -->|"(requested_count, reasoning)"| Safety[Safety Controller]
+    Safety -->|DialPlan| Allocator[Call Allocator]
+    Allocator -->|AGENT_BOUND calls| Provider[Mock Telecom Provider]
+    Allocator -->|PREDICTIVE_UNASSIGNED calls| Provider
+    Provider -->|Provider Events| Ingestion[Event Ingestion]
+    Ingestion --> StateMachine[State Machine]
+    StateMachine --> DB[(PostgreSQL)]
+    DB -->|snapshot| Pacing
+    DB -->|snapshot| Safety
+
+    Worker[Worker Processes] --> Pacing
+    Worker --> Allocator
+    Worker --> Ingestion
+    Reaper[Lease Reaper] -->|reconciles stale leases| DB
+    Reaper -->|reconciliation lookup| Provider
