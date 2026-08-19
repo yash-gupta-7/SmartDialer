@@ -24,6 +24,43 @@ Postgres is already the single source of truth; `FOR UPDATE SKIP LOCKED` is a we
 Postgres work-queue pattern, so nothing here needs a separate broker or cache. Introducing
 one would add operational surface area without solving a problem this prototype actually has.
 
+## Safety Controller boundary
+
+The Pacing Engine (Progressive or Predictive) only recommends: it reads a DB snapshot and
+returns `(requested_count, reasoning)`, with no import path to the Call Allocator or the
+Provider. The Safety Controller is the sole authority that can turn a recommendation into
+action — it independently validates and bounds that recommendation against live risk signals
+(answer rate, abandon rate, agents actually free-soon) and produces a `DialPlan`, not a
+rubber-stamped integer. Only the Safety Controller may call the Allocator, and only the
+Allocator may call the Provider. This is a structural boundary, not a convention: a pacing
+engine cannot reach the Allocator or Provider even if its own logic were compromised or wrong,
+because it never holds a reference to either.
+
+## Progressive vs Predictive
+
+Progressive is deterministic agent-bound dialing: it requests exactly as many calls as there
+are available agents, so every dialed call already has an agent reserved
+(`AGENT_BOUND`) before it rings. Predictive is controlled dial-ahead: it may request more
+calls than there are currently-free agents, betting on agents becoming free before the
+borrower answers — those calls are created `PREDICTIVE_UNASSIGNED` (borrower reserved, no
+agent yet) and only claim an agent atomically once the borrower actually answers. Both modes
+are just different `(requested_count, reasoning)` producers behind the same Pacing Engine
+interface, and both are gated by the same Safety Controller — Predictive's more aggressive
+recommendation is never trusted blindly, and it cannot place a call or bypass the Safety
+Controller's bounds. If a Predictive-unassigned call answers with no agent available in time,
+it goes to `AWAITING_AGENT` and then `ABANDONED` on timeout, never a silent drop.
+
+## Provider abstraction
+
+`smartdialer/providers/base.py` defines the provider interface
+(`place_call`/`next_event`/`get_call_status`) that isolates all telecom-specific behavior from
+the rest of the system — the Allocator, Event Ingestion, and state machine never know which
+provider they're talking to. Mock A and Mock B are two independent implementations of that
+interface with different simulated latency, answer-rate, and event-duplication behavior,
+selectable at the worker CLI (`--provider A|B`). Core allocation and state logic is
+provider-independent: swapping providers changes only which mock generates events, not how
+those events are ingested or how calls/agents transition state.
+
 ## What breaks first at scale (100 -> 1,000 -> 10,000 agents)
 
 Contention on `agents`/`borrowers` under `FOR UPDATE SKIP LOCKED` batch claims as worker

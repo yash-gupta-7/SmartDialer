@@ -26,17 +26,20 @@ Provider.
 
 ## 2. Stack
 
-Python, FastAPI, PostgreSQL (via Docker Compose), SQLAlchemy, Pydantic,
-asyncio (provider simulation), pytest.
+Python, PostgreSQL (via Docker Compose), SQLAlchemy, Pydantic, asyncio
+(provider simulation), pytest. The prototype is operated entirely through
+CLI commands and Python modules (`python -m smartdialer.worker`,
+`python -m smartdialer.simulation`, `python -m smartdialer.load_test`) —
+there is no HTTP/API layer.
 
 | Choice | Why | What it makes harder |
 |---|---|---|
 | PostgreSQL | Row-level locking + `SELECT ... FOR UPDATE SKIP LOCKED` lets concurrent workers claim disjoint agents/borrowers without serializing behind one writer, unlike SQLite. Directly demonstrates the distributed-correctness story the assignment grades on. | Requires Docker/a running server instead of a single file — mitigated with `docker-compose up`. |
-| FastAPI | Thin control/inspection layer (start campaign, view state, receive simulated provider webhooks) with Pydantic validation for free. | Not strictly required for a CLI-only prototype — kept minimal, not a distributed API. |
 | SQLAlchemy | Reservation-critical SQL is still hand-written (`SELECT ... FOR UPDATE SKIP LOCKED`, conditional `UPDATE ... WHERE`) so the ORM never obscures the transaction boundary; used for schema/session management. | One more layer to reason about vs. raw psycopg — acceptable since it doesn't touch the correctness-critical path's semantics. |
-| Pydantic | Validates event payloads and API/domain models. | N/A |
+| Pydantic | Validates event payloads and domain models. | N/A |
 | asyncio | Simulated provider I/O (latency, timeout, duplication) without threads. | Not the concurrency mechanism for correctness — that's Postgres, per design constraint. |
 | pytest | Unit + deterministic concurrency tests via real subprocess workers. | N/A |
+| No FastAPI/HTTP layer | The prototype is driven by CLI entrypoints and directly-invoked Python modules; no control/inspection API was built. | Nothing external can start a campaign or inspect state without DB access or a CLI invocation — acceptable for this timeboxed prototype, would need revisiting for a real multi-tenant control plane. |
 | No Redis/Kafka/Celery | Nothing in this prototype needs a message broker or distributed cache; Postgres is already the single source of truth and the natural queue (`FOR UPDATE SKIP LOCKED` is a well-known Postgres queue pattern). | If real horizontal scale-out across many DB shards were needed, this would need revisiting — explicitly out of scope. |
 
 ## 3. Component responsibilities
